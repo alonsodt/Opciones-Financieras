@@ -1,6 +1,5 @@
-yfinance
-pandas
-numpy
-matplotlib
-scipy
-pyyaml
+ib-insync>=0.9.86
+pandas>=2.0
+numpy>=1.24
+matplotlib>=3.8
+python-dotenv>=1.0
