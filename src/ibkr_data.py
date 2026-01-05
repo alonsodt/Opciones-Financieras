@@ -3,12 +3,24 @@
 
 from __future__ import annotations
 
+# ======================================================
+# FIX EVENT LOOP (CRÍTICO PARA ib_insync / eventkit)
+# ======================================================
+import asyncio
+try:
+    asyncio.get_event_loop()
+except RuntimeError:
+    asyncio.set_event_loop(asyncio.new_event_loop())
+
+# ======================================================
+# Imports
+# ======================================================
 import math
 from dataclasses import dataclass
-from typing import Iterable, Tuple, Dict, Any, Optional
+from typing import Iterable, Tuple, Dict, Any
 
 import pandas as pd
-from ib_insync import IB, Stock, Option, util
+from ib_insync import IB, Stock, Option, Index, util
 
 
 # =============================
@@ -59,10 +71,9 @@ class IBKRConfig:
     timeout: int = 10
 
     # Para BACKTEST: ponlo en False (por defecto).
-    # Si lo pones True, se harán reqMktData y pueden aparecer 10089/10091 sin subs.
     use_market_data: bool = False
 
-    # Market data type: 1=live, 2=frozen, 3=delayed, 4=delayed-frozen
+    # 1=live, 2=frozen, 3=delayed, 4=delayed-frozen
     market_data_type: int = 3
 
     # Filtrar warnings típicos de subscripción
@@ -75,9 +86,8 @@ class IBKRConfig:
 class IBKRData:
     """
     Cliente IBKR robusto para backtest:
-    - Históricos (reqHistoricalData) como fuente principal (sin depender de subscripciones)
-    - Option chain (reqSecDefOptParams) + qualifyContracts
-    - Market data (reqMktData) opcional (desactivado por defecto)
+    - Históricos como fuente principal
+    - Market data live opcional (desactivado por defecto)
     """
 
     def __init__(self, cfg: IBKRConfig):
@@ -93,10 +103,8 @@ class IBKRData:
             return
 
         def on_error(reqId, errorCode, errorString, contract):
-            # Silencia mensajes de subscripción típicos
             if errorCode in self.cfg.suppress_error_codes:
                 return
-            # Si no está filtrado, lo imprimimos
             print(f"IBKR Error {errorCode}, reqId {reqId}: {errorString}, contract: {contract}")
 
         self.ib.errorEvent += on_error
@@ -117,8 +125,6 @@ class IBKRData:
         )
 
         self._install_error_filter()
-
-        # Solo relevante si use_market_data=True
         self.ib.reqMarketDataType(self.cfg.market_data_type)
 
     def disconnect(self) -> None:
@@ -133,8 +139,13 @@ class IBKRData:
         self.ib.qualifyContracts(stk)
         return stk
 
+    def index(self, symbol: str, exchange: str = "CBOE", currency: str = "USD") -> Index:
+        idx = Index(symbol, exchange, currency)
+        self.ib.qualifyContracts(idx)
+        return idx
+
     # -------------------------
-    # Historical bars (core)
+    # Historical bars (CORE)
     # -------------------------
     def historical_bars(
         self,
@@ -160,16 +171,11 @@ class IBKRData:
             return df
 
         df = df.rename(columns={"date": "datetime"})
-        df["datetime"] = pd.to_datetime(df["datetime"])
+        df["datetime"] = pd.to_datetime(df["datetime"]).dt.tz_localize(None)
         df = df.sort_values("datetime").reset_index(drop=True)
         return df
 
-    def last_close_from_history(
-        self,
-        contract,
-        duration: str = "5 D",
-        use_rth: bool = True
-    ) -> float:
+    def last_close_from_history(self, contract, duration: str = "5 D", use_rth: bool = True) -> float:
         bars = self.ib.reqHistoricalData(
             contract,
             endDateTime="",
@@ -185,181 +191,45 @@ class IBKRData:
         return float(bars[-1].close)
 
     def reference_price(self, contract) -> float:
-        """
-        Para BACKTEST: SOLO históricos (evita reqMktData => evita 10089/10091).
-        Si en algún momento quieres live/delayed, activa cfg.use_market_data=True.
-        """
         if not self.cfg.use_market_data:
             return self.last_close_from_history(contract)
 
-        # Si lo activas, intentamos mktData pero sin romper si no hay datos.
         try:
             t = self.ib.reqMktData(contract, "", False, False)
             self.ib.sleep(1.5)
-            last = getattr(t, "last", None)
-            if _is_finite_pos(last):
-                return float(last)
-            close = getattr(t, "close", None)
-            if _is_finite_pos(close):
-                return float(close)
+            if _is_finite_pos(getattr(t, "last", None)):
+                return float(t.last)
+            if _is_finite_pos(getattr(t, "close", None)):
+                return float(t.close)
         except Exception:
             pass
 
         return self.last_close_from_history(contract)
 
     # -------------------------
-    # Option chain
+    # VIX historical
     # -------------------------
-    def option_chain_params(self, symbol: str, exchange: str = "SMART", currency: str = "USD"):
-        stk = self.stock(symbol, exchange=exchange, currency=currency)
-        chains = self.ib.reqSecDefOptParams(stk.symbol, "", stk.secType, stk.conId)
-        if not chains:
-            raise RuntimeError("reqSecDefOptParams devolvió vacío. Revisa permisos/contrato.")
-
-        best = sorted(
-            chains,
-            key=lambda c: (len(getattr(c, "expirations", [])), len(getattr(c, "strikes", []))),
-            reverse=True
-        )[0]
-        return best
-
-    def pick_expiry_near_days(self, expirations: Iterable[str], target_days: int = 30) -> str:
-        import datetime as dt
-        today = dt.date.today()
-        best_exp = None
-        best_diff = 10**9
-
-        for e in expirations:
-            try:
-                d = dt.datetime.strptime(e, "%Y%m%d").date()
-            except Exception:
-                continue
-            diff = abs((d - today).days - target_days)
-            if diff < best_diff:
-                best_diff = diff
-                best_exp = e
-
-        if best_exp is None:
-            raise RuntimeError("No se pudo seleccionar expiración.")
-        return best_exp
-
-    def find_valid_atm_straddle(
+    def historical_vix(
         self,
-        symbol: str,
-        expiry: str,
-        strikes: Iterable[float],
-        trading_class: str,
-        multiplier: str,
-        exchange: str = "SMART",
-        currency: str = "USD",
-        tries: int = 25
-    ) -> Tuple[float, Option, Option]:
-        stk = self.stock(symbol, exchange=exchange, currency=currency)
-        S = self.reference_price(stk)
-        if not _is_finite_pos(S):
-            raise RuntimeError("No se pudo obtener spot/ref price del subyacente.")
-
-        sorted_strikes = sorted(strikes, key=lambda k: abs(float(k) - S))[:tries]
-
-        for K in sorted_strikes:
-            K = float(K)
-            c = Option(symbol, expiry, K, "C", exchange, currency=currency,
-                       multiplier=str(multiplier), tradingClass=trading_class)
-            p = Option(symbol, expiry, K, "P", exchange, currency=currency,
-                       multiplier=str(multiplier), tradingClass=trading_class)
-
-            self.ib.qualifyContracts(c, p)
-
-            if getattr(c, "conId", 0) not in (0, None) and getattr(p, "conId", 0) not in (0, None):
-                return K, c, p
-
-        raise RuntimeError(f"No se encontró strike ATM válido para expiry={expiry} probando {tries} strikes.")
-
-    # -------------------------
-    # Option snapshot (optional)
-    # -------------------------
-    def option_snapshot_light(self, opt: Option, sleep_s: float = 1.5) -> Dict[str, Any]:
+        duration: str = "10 Y",
+        bar_size: str = "1 day",
+        use_rth: bool = True
+    ) -> pd.DataFrame:
         """
-        Snapshot ligero SOLO si cfg.use_market_data=True.
-        Si está False, devuelve NaNs (para que no intentes usarlo en backtest).
-        """
-        self.ib.qualifyContracts(opt)
-
-        if not self.cfg.use_market_data:
-            return {
-                "localSymbol": getattr(opt, "localSymbol", None),
-                "conId": getattr(opt, "conId", None),
-                "bid": float("nan"),
-                "ask": float("nan"),
-                "last": float("nan"),
-                "close": float("nan"),
-                "mid": float("nan"),
-            }
-
-        t = self.ib.reqMktData(opt, "", False, False)
-        self.ib.sleep(sleep_s)
-
-        return {
-            "localSymbol": getattr(opt, "localSymbol", None),
-            "conId": getattr(opt, "conId", None),
-            "bid": getattr(t, "bid", float("nan")),
-            "ask": getattr(t, "ask", float("nan")),
-            "last": getattr(t, "last", float("nan")),
-            "close": getattr(t, "close", float("nan")),
-            "mid": mid_price(t),
-        }
-    
-    def index(self, symbol: str, exchange: str = "CBOE", currency: str = "USD"):
-        idx = Index(symbol, exchange, currency)
-        self.ib.qualifyContracts(idx)
-        return idx
-
-    def historical_vix(self, duration: str = "10 Y", bar_size: str = "1 day", use_rth: bool = True) -> pd.DataFrame:
-        """
-        Descarga histórico de VIX (CBOE). Usaremos el close diario como proxy de IV 30d.
+        Descarga histórico diario del VIX (CBOE).
         """
         vix = self.index("VIX", exchange="CBOE", currency="USD")
-        df = self.historical_bars(vix, duration=duration, bar_size=bar_size, what="TRADES", use_rth=use_rth)
-    
-        # Normaliza nombre de close
-        if not df.empty:
-            df = df[["datetime", "close"]].copy()
-            df = df.rename(columns={"close": "vix_close"})
+        df = self.historical_bars(
+            vix,
+            duration=duration,
+            bar_size=bar_size,
+            what="TRADES",
+            use_rth=use_rth
+        )
+
+        if df.empty:
             return df
 
-# =============================
-# Manual smoke test
-# =============================
-if __name__ == "__main__":
-    # IMPORTANTE: para evitar 10089/10091 en consola, deja use_market_data=False
-    cfg = IBKRConfig(host="127.0.0.1", port=7497, client_id=28, use_market_data=False)
-    ibd = IBKRData(cfg)
-
-    try:
-        ibd.connect()
-
-        spy = ibd.stock("SPY")
-        px = ibd.reference_price(spy)
-        print("SPY ref price (history-based):", px)
-
-        chain = ibd.option_chain_params("SPY")
-        expiry = ibd.pick_expiry_near_days(chain.expirations, target_days=30)
-
-        K, c, p = ibd.find_valid_atm_straddle(
-            symbol="SPY",
-            expiry=expiry,
-            strikes=chain.strikes,
-            trading_class=chain.tradingClass,
-            multiplier=chain.multiplier
-        )
-        print("Expiry:", expiry, "K:", K, "Call:", c.localSymbol, "Put:", p.localSymbol)
-
-        # Snapshot solo si lo activas (si no, devuelve NaNs sin pedir market data)
-        print("Call snapshot:", ibd.option_snapshot_light(c))
-        print("Put snapshot:", ibd.option_snapshot_light(p))
-
-        df = ibd.historical_bars(spy, duration="2 Y", bar_size="1 day")
-        print("Hist bars tail:\n", df.tail(3))
-
-    finally:
-        ibd.disconnect()
+        df = df[["datetime", "close"]].copy()
+        df = df.rename(columns={"close": "vix_close"})
+        return df
