@@ -1,261 +1,299 @@
+# src/strategy.py
+# -*- coding: utf-8 -*-
+
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass
+from typing import Optional, Literal, Dict, Any, Tuple, List
+
+import numpy as np
+import pandas as pd
+
+from src.pricing import bs_price_greeks, straddle_greeks, hist_vol_close
+
+
+RollFreq = Literal["W", "M"]
+
+
+# =========================
+# Config dataclasses (simple)
+# =========================
 @dataclass
-class StraddlePosition:
-    entry_date: pd.Timestamp
-    expiry: pd.Timestamp
-    K: float
-    entry_spot: float
-    sigma_entry: float
-    r_entry: float
-    q_entry: float
-    call_entry_price: float
-    put_entry_price: float
-    contracts: int = 1  # 1 contrato (multiplicador 100)
-
-    @property
-    def premium_paid(self):
-        return (self.call_entry_price + self.put_entry_price) * 100 * self.contracts
+class StraddleParams:
+    expiry_target_days: int = 30
+    roll_frequency: RollFreq = "M"        # "W" o "M"
+    strike_round: float = 1.0             # 1.0 para strikes enteros (SPY suele ir por 1)
+    contracts: int = 1                    # nº de straddles (call+put)
+    multiplier: int = 100                 # SPY options multiplier
 
 
-def build_monthly_straddles(spy_df, r_series, target_days=30, rule="M",
-                            use_chain_iv_on_entry=True, realized_vol_window=20):
+@dataclass
+class PricingParams:
+    vol_window: int = 20
+    vol_annualization: int = 252
+    risk_free_rate: float = 0.0
+    dividend_yield: float = 0.0
+    days_in_year: int = 365
+
+
+@dataclass
+class HedgeParams:
+    enabled: bool = False
+    target_delta: float = 0.0
+    rebalance_threshold: float = 0.05     # hedge si |delta - target| > threshold
+
+
+# =========================
+# Internal helpers
+# =========================
+def _to_timestamp(x) -> pd.Timestamp:
+    return pd.Timestamp(x).tz_localize(None) if getattr(x, "tzinfo", None) else pd.Timestamp(x)
+
+
+def _roll_dates(index: pd.DatetimeIndex, freq: RollFreq) -> pd.DatetimeIndex:
     """
-    Construye una lista de straddles con roll periódico.
-    - En cada fecha de entrada: elige vencimiento ~30 días y strike ATM.
-    - sigma_entry: IV del chain (si disponible) o realized vol (fallback).
-    - precios de entrada: mid de call/put ATM (si hay chain); si no, BS con sigma_entry.
+    Devuelve fechas de roll dentro de un índice diario.
+    - M: primer día de cada mes presente en index
+    - W: primer día de cada semana (lunes) presente en index
     """
-    ticker = yf.Ticker("SPY")
-    q = get_dividend_yield_proxy(spy_df)
+    idx = pd.DatetimeIndex(index).tz_localize(None)
 
-    entry_dates = pick_monthly_entry_dates(spy_df, rule=rule)
-    rv = realized_vol(spy_df["adj_close"], window=realized_vol_window)
+    if freq == "M":
+        # primer día disponible por mes
+        grp = pd.Series(idx).groupby([idx.year, idx.month]).min()
+        return pd.DatetimeIndex(grp.values)
+    elif freq == "W":
+        # lunes de cada semana (o primer día disponible de esa semana)
+        # agrupamos por ISO year/week
+        iso = idx.isocalendar()
+        grp = pd.Series(idx).groupby([iso["year"].values, iso["week"].values]).min()
+        return pd.DatetimeIndex(grp.values)
+    else:
+        raise ValueError("roll_frequency debe ser 'W' o 'M'.")
 
-    positions = []
 
-    for d in entry_dates:
-        if d not in spy_df.index:
-            continue
-        spot = float(spy_df.loc[d, "adj_close"])
-        r = float(r_series.reindex(spy_df.index).ffill().loc[d]) if d in r_series.index or True else 0.04
+def _pick_expiry_date(roll_date: pd.Timestamp, target_days: int) -> pd.Timestamp:
+    """
+    Para el backtest teórico (sin chain histórica), aproximamos la expiración como:
+    roll_date + target_days.
+    Luego, si cae en fin de semana, la movemos al viernes anterior.
+    """
+    exp = roll_date + pd.Timedelta(days=int(target_days))
 
-        # Intentar chain para obtener expiry/strikes/IV
-        expiry_str = None
-        call_mid = put_mid = None
-        K = None
-        sigma_entry = np.nan
+    # Ajuste simple: si sábado/domingo -> viernes
+    while exp.weekday() >= 5:
+        exp = exp - pd.Timedelta(days=1)
 
-        try:
-            expiries = ticker.options
-            expiry_str = choose_expiry_from_chain(expiries, target_days=target_days)
-            if expiry_str is None:
-                raise ValueError("Sin expiries")
-            chain = ticker.option_chain(expiry_str)
-            calls = chain.calls.copy()
-            puts = chain.puts.copy()
+    return exp
 
-            K = get_atm_strike_from_chain(calls, spot)
 
-            call_row = calls.loc[calls["strike"].astype(float) == K].iloc[0]
-            put_row = puts.loc[puts["strike"].astype(float) == K].iloc[0]
+def _round_to_step(x: float, step: float) -> float:
+    if step <= 0:
+        return float(x)
+    return round(x / step) * step
 
-            call_mid = get_mid_price(call_row)
-            put_mid = get_mid_price(put_row)
 
-            if use_chain_iv_on_entry:
-                iv_call = get_iv_from_chain_row(call_row)
-                iv_put = get_iv_from_chain_row(put_row)
-                sigma_entry = np.nanmean([iv_call, iv_put])
+# =========================
+# Main strategy simulator
+# =========================
+def simulate_periodic_straddle(
+    df_spy: pd.DataFrame,
+    straddle: StraddleParams,
+    pricing: PricingParams,
+    hedge: HedgeParams,
+    initial_cash: float = 100000.0
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Simula:
+    - Long straddle periódico (roll W/M)
+    - (Opcional) delta-hedge con subyacente (shares) usando tus griegas BS.
 
-        except Exception:
-            # si Yahoo falla ese día: no hay chain fiable => usaremos BS
-            expiry_str = None
+    Inputs:
+    - df_spy: DataFrame con columnas: ['datetime','close'] mínimo.
+    - straddle: parámetros de roll y tamaño.
+    - pricing: parámetros de vol y BS.
+    - hedge: reglas de hedge.
+    - initial_cash: cash inicial.
 
-        # fallback de sigma
-        if not np.isfinite(sigma_entry) or sigma_entry <= 0:
-            sigma_entry = float(rv.loc[d]) if np.isfinite(rv.loc[d]) else 0.20
+    Outputs:
+    - daily: MTM diario, greeks, hedge, equity
+    - trades: eventos de roll y hedge (simulados)
+    """
+    if "datetime" not in df_spy.columns or "close" not in df_spy.columns:
+        raise ValueError("df_spy debe tener columnas: datetime, close")
 
-        # fallback de expiry si no hay chain
-        if expiry_str is None:
-            expiry = (d + pd.Timedelta(days=target_days))
+    df = df_spy.copy()
+    df["datetime"] = pd.to_datetime(df["datetime"]).dt.tz_localize(None)
+    df = df.sort_values("datetime").reset_index(drop=True)
+    df = df.set_index("datetime")
+    idx = df.index
+
+    # sigma histórica rolling (anualizada)
+
+    if sigma_col in df.columns:
+        df["sigma"] = df[sigma_col].astype(float)
+    else:
+        df["sigma"] = hist_vol_close(df["close"], window=pricing.vol_window, annualization=pricing.vol_annualization)
+
+
+    # fechas de roll
+    roll_dates = set(_roll_dates(idx, straddle.roll_frequency))
+
+    # Estado de la “posición actual”
+    current_K: Optional[float] = None
+    current_expiry: Optional[pd.Timestamp] = None
+    in_position: bool = False
+
+    # Hedge (shares del subyacente)
+    shares = 0.0
+
+    # Cash/equity tracking
+    cash = float(initial_cash)
+
+    # Logs
+    daily_rows: List[Dict[str, Any]] = []
+    trades_rows: List[Dict[str, Any]] = []
+
+    # Helpers: pricing multipliers
+    contracts = float(straddle.contracts)
+    mult = float(straddle.multiplier)
+
+    for t in idx:
+        S = float(df.loc[t, "close"])
+        sigma = float(df.loc[t, "sigma"]) if math.isfinite(float(df.loc[t, "sigma"])) else float("nan")
+        r = float(pricing.risk_free_rate)
+        q = float(pricing.dividend_yield)
+
+        # 1) Si toca roll (o aún no estamos posicionados), abrimos nuevo straddle
+        if (t in roll_dates) or (not in_position) or (current_expiry is not None and t >= current_expiry):
+            # Cerrar posición anterior (si existe) al precio teórico del día t
+            if in_position and current_K is not None and current_expiry is not None:
+                T_old = max((current_expiry - t).days / pricing.days_in_year, 1e-9)
+
+                if math.isfinite(sigma):
+                    old = straddle_greeks(S, current_K, T_old, r, sigma, q=q, days_in_year=pricing.days_in_year)
+                    opt_value_old = old["price"] * contracts * mult
+                else:
+                    opt_value_old = float("nan")
+
+                # En este backtest teórico: cerramos a valor teórico -> cash aumenta por valor de la posición
+                if math.isfinite(opt_value_old):
+                    cash += opt_value_old
+
+                trades_rows.append({
+                    "datetime": t,
+                    "type": "ROLL_CLOSE",
+                    "K": current_K,
+                    "expiry": current_expiry,
+                    "contracts": contracts,
+                    "option_value": opt_value_old
+                })
+
+            # Abrir nuevo straddle
+            current_expiry = _pick_expiry_date(t, straddle.expiry_target_days)
+            current_K = _round_to_step(S, straddle.strike_round)
+            in_position = True
+
+            # Coste de abrir (pagas prima teórica)
+            if math.isfinite(sigma):
+                T_new = max((current_expiry - t).days / pricing.days_in_year, 1e-9)
+                new = straddle_greeks(S, current_K, T_new, r, sigma, q=q, days_in_year=pricing.days_in_year)
+                opt_value_new = new["price"] * contracts * mult
+            else:
+                opt_value_new = float("nan")
+
+            if math.isfinite(opt_value_new):
+                cash -= opt_value_new
+
+            trades_rows.append({
+                "datetime": t,
+                "type": "ROLL_OPEN",
+                "K": current_K,
+                "expiry": current_expiry,
+                "contracts": contracts,
+                "option_value": opt_value_new
+            })
+
+            # Nota: no tocamos hedge aquí; se gestiona abajo según delta
+
+        # 2) Mark-to-market del straddle actual
+        if in_position and current_K is not None and current_expiry is not None and math.isfinite(sigma):
+            T = max((current_expiry - t).days / pricing.days_in_year, 1e-9)
+            st = straddle_greeks(S, current_K, T, r, sigma, q=q, days_in_year=pricing.days_in_year)
+            opt_price = st["price"]                 # por 1 straddle (call+put) y 1x
+            opt_value = opt_price * contracts * mult
+
+            # Greeks cartera (en unidades por 1 subyacente)
+            # Delta de una opción es por 1 acción; para cartera: *contracts*mult
+            port_delta = st["delta"] * contracts * mult
+            port_gamma = st["gamma"] * contracts * mult
+            port_vega_1pct = st["vega_1pct"] * contracts * mult
+            port_theta_day = st["theta_day"] * contracts * mult
+
         else:
-            expiry = pd.to_datetime(expiry_str)
+            T = float("nan")
+            opt_price = float("nan")
+            opt_value = 0.0
+            port_delta = 0.0
+            port_gamma = 0.0
+            port_vega_1pct = 0.0
+            port_theta_day = 0.0
 
-        # tiempo en años desde entry hasta expiry
-        T = max((expiry - d).days / 365.0, 1/365)
+        # 3) Delta hedge con subyacente (si enabled)
+        hedge_trade = 0.0
+        if hedge.enabled and in_position and math.isfinite(port_delta):
+            # Delta total incluyendo el hedge actual en acciones
+            total_delta = port_delta + shares  # porque 1 share = delta 1
 
-        # si no tenemos precios del chain, valoramos con BS en entry
-        if (call_mid is None) or (put_mid is None) or (call_mid == 0) or (put_mid == 0) or (K is None):
-            K = float(round(spot))  # ATM aproximado
-            call_mid = BlackScholesOption(spot, K, T, r, sigma_entry, "call", q=q).price()
-            put_mid = BlackScholesOption(spot, K, T, r, sigma_entry, "put", q=q).price()
+            if abs(total_delta - hedge.target_delta) > hedge.rebalance_threshold:
+                # Ajustamos shares para acercarnos al target
+                desired_shares = hedge.target_delta - port_delta
+                hedge_trade = desired_shares - shares  # compra(+)/venta(-)
 
-        pos = StraddlePosition(
-            entry_date=d,
-            expiry=expiry,
-            K=float(K),
-            entry_spot=spot,
-            sigma_entry=float(sigma_entry),
-            r_entry=float(r),
-            q_entry=float(q),
-            call_entry_price=float(call_mid),
-            put_entry_price=float(put_mid),
-            contracts=1,
-        )
-        positions.append(pos)
+                # Ejecutamos a precio S (sin slippage/fees aquí; eso irá en execution.py)
+                cash -= hedge_trade * S
+                shares = desired_shares
 
-    return positions
+                trades_rows.append({
+                    "datetime": t,
+                    "type": "HEDGE_TRADE",
+                    "shares_trade": hedge_trade,
+                    "shares_pos": shares,
+                    "price": S,
+                    "cash_after": cash
+                })
 
+        # 4) Equity (cash + MTM opciones + MTM hedge)
+        equity = cash + opt_value + shares * S
 
-def price_straddle_bs(spot, K, T, r, sigma, q=0.0):
-    call = BlackScholesOption(spot, K, T, r, sigma, "call", q=q)
-    put = BlackScholesOption(spot, K, T, r, sigma, "put", q=q)
-    return call.price(), put.price(), call, put
+        daily_rows.append({
+            "datetime": t,
+            "S": S,
+            "sigma": sigma,
+            "K": current_K,
+            "expiry": current_expiry,
+            "T_years": T,
+            "contracts": contracts,
+            "shares": shares,
 
+            "opt_price_straddle": opt_price,
+            "opt_value": opt_value,
 
-def backtest_straddle(spy_df, r_series, positions, mark_sigma="entry",
-                      realized_vol_window=20):
-    """
-    Backtest de P&L diario del straddle "no hedged":
-    - Marcaje diario por BS:
-        mark_sigma="entry" -> sigma constante (la de entrada)
-        mark_sigma="realized" -> sigma rolling diaria (proxy)
-    """
-    rv = realized_vol(spy_df["adj_close"], window=realized_vol_window)
-    r_daily = r_series.reindex(spy_df.index).ffill().fillna(0.04)
+            "delta_opt": port_delta,
+            "gamma_opt": port_gamma,
+            "vega_1pct_opt": port_vega_1pct,
+            "theta_day_opt": port_theta_day,
 
-    # Resultado diario: equity curve y P&L de cada posición
-    equity = pd.Series(0.0, index=spy_df.index)
-    pnl_trades = []
-
-    for pos in positions:
-        # rango de vida de la posición
-        life_idx = spy_df.index[(spy_df.index >= pos.entry_date) & (spy_df.index <= pos.expiry)]
-        if len(life_idx) < 2:
-            continue
-
-        # coste inicial (premium pagada)
-        premium = pos.premium_paid
-
-        # mark-to-market diario
-        vals = []
-        for d in life_idx:
-            spot = float(spy_df.loc[d, "adj_close"])
-            T = max((pos.expiry - d).days / 365.0, 1/365)
-
-            r = float(r_daily.loc[d])
-            q = pos.q_entry
-
-            if mark_sigma == "realized":
-                sigma = float(rv.loc[d]) if np.isfinite(rv.loc[d]) else pos.sigma_entry
-            else:
-                sigma = pos.sigma_entry
-
-            call_p, put_p, _, _ = price_straddle_bs(spot, pos.K, T, r, sigma, q=q)
-            val = (call_p + put_p) * 100 * pos.contracts
-            vals.append(val)
-
-        vals = pd.Series(vals, index=life_idx)
-        trade_pnl = vals.iloc[-1] - premium
-        pnl_trades.append({
-            "entry": pos.entry_date,
-            "expiry": pos.expiry,
-            "K": pos.K,
-            "premium": premium,
-            "final_value": float(vals.iloc[-1]),
-            "pnl": float(trade_pnl),
-            "sigma_entry": pos.sigma_entry
+            "cash": cash,
+            "equity": equity,
         })
 
-        # añadimos la curva del trade al equity (overlapping: sumamos MTM)
-        equity.loc[life_idx] += (vals - premium)
+    daily = pd.DataFrame(daily_rows).set_index("datetime")
+    trades = pd.DataFrame(trades_rows)
+    if not trades.empty:
+        trades["datetime"] = pd.to_datetime(trades["datetime"]).dt.tz_localize(None)
+        trades = trades.sort_values("datetime").reset_index(drop=True)
 
-    trades_df = pd.DataFrame(pnl_trades).sort_values("entry").reset_index(drop=True)
-    return equity, trades_df
+    return daily, trades
 
-
-def backtest_delta_hedged_straddle(spy_df, r_series, positions,
-                                  hedge_rebalance="daily",
-                                  mark_sigma="entry",
-                                  realized_vol_window=20,
-                                  transaction_cost_bps=1.0):
-    """
-    Backtest delta-hedged:
-    - Mantienes el straddle y ajustas la posición en subyacente para neutralizar delta.
-    - Se rebalancea 'daily' (por defecto).
-    - Costes de transacción (bps) aplicados al notional del subyacente en cada rebalanceo.
-
-    Output:
-      equity_curve (serie)
-      trades (resumen por trade)
-    """
-    rv = realized_vol(spy_df["adj_close"], window=realized_vol_window)
-    r_daily = r_series.reindex(spy_df.index).ffill().fillna(0.04)
-
-    equity = pd.Series(0.0, index=spy_df.index)
-    trades_out = []
-
-    tc = transaction_cost_bps / 10000.0  # bps -> decimal
-
-    for pos in positions:
-        life_idx = spy_df.index[(spy_df.index >= pos.entry_date) & (spy_df.index <= pos.expiry)]
-        if len(life_idx) < 2:
-            continue
-
-        # Estado del hedge
-        shares = 0.0
-        cash = -pos.premium_paid  # pagas la prima al entrar
-        cumulative_tc = 0.0
-
-        # MTM diario
-        mtm_series = []
-
-        for i, d in enumerate(life_idx):
-            spot = float(spy_df.loc[d, "adj_close"])
-            T = max((pos.expiry - d).days / 365.0, 1/365)
-            r = float(r_daily.loc[d])
-            q = pos.q_entry
-
-            if mark_sigma == "realized":
-                sigma = float(rv.loc[d]) if np.isfinite(rv.loc[d]) else pos.sigma_entry
-            else:
-                sigma = pos.sigma_entry
-
-            call_p, put_p, call_obj, put_obj = price_straddle_bs(spot, pos.K, T, r, sigma, q=q)
-            opt_value = (call_p + put_p) * 100 * pos.contracts
-
-            # Delta del straddle (por 1 contrato)
-            delta = (call_obj.delta() + put_obj.delta()) * 100 * pos.contracts
-
-            # rebalance
-            if hedge_rebalance == "daily":
-                target_shares = -delta  # neutraliza delta
-                d_shares = target_shares - shares
-                if abs(d_shares) > 1e-8:
-                    # comprar/vender subyacente: afecta cash
-                    trade_notional = d_shares * spot
-                    # coste transacción
-                    this_tc = abs(trade_notional) * tc
-                    cumulative_tc += this_tc
-                    cash -= trade_notional
-                    cash -= this_tc
-                    shares = target_shares
-
-            # MTM total: opciones + shares*spot + cash
-            mtm = opt_value + shares * spot + cash
-            mtm_series.append(mtm)
-
-        mtm_series = pd.Series(mtm_series, index=life_idx)
-        trade_pnl = float(mtm_series.iloc[-1])  # ya está neto de prima (en cash inicial)
-        trades_out.append({
-            "entry": pos.entry_date,
-            "expiry": pos.expiry,
-            "K": pos.K,
-            "sigma_entry": pos.sigma_entry,
-            "pnl": trade_pnl,
-            "tc_total": cumulative_tc
-        })
-
-        equity.loc[life_idx] += mtm_series
-
-    trades_df = pd.DataFrame(trades_out).sort_values("entry").reset_index(drop=True)
-    return equity, trades_df
