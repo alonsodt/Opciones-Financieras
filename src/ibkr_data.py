@@ -20,11 +20,7 @@ from dataclasses import dataclass
 from typing import Iterable, Tuple, Dict, Any
 
 import pandas as pd
-<<<<<<< HEAD
-from ib_insync import IB, Stock, Option, util, Index
-=======
 from ib_insync import IB, Stock, Option, Index, util
->>>>>>> 123b099418ae546f899d96f222ddf13326b44aaf
 
 
 # =============================
@@ -222,76 +218,6 @@ class IBKRData:
         """
         Descarga histórico diario del VIX (CBOE).
         """
-<<<<<<< HEAD
-        self.ib.qualifyContracts(opt)
-
-        if not self.cfg.use_market_data:
-            return {
-                "localSymbol": getattr(opt, "localSymbol", None),
-                "conId": getattr(opt, "conId", None),
-                "bid": float("nan"),
-                "ask": float("nan"),
-                "last": float("nan"),
-                "close": float("nan"),
-                "mid": float("nan"),
-            }
-
-        t = self.ib.reqMktData(opt, "", False, False)
-        self.ib.sleep(sleep_s)
-
-        return {
-            "localSymbol": getattr(opt, "localSymbol", None),
-            "conId": getattr(opt, "conId", None),
-            "bid": getattr(t, "bid", float("nan")),
-            "ask": getattr(t, "ask", float("nan")),
-            "last": getattr(t, "last", float("nan")),
-            "close": getattr(t, "close", float("nan")),
-            "mid": mid_price(t),
-        }
-    
-    def index(self, symbol: str, exchange: str = "CBOE", currency: str = "USD"):
-        idx = Index(symbol, exchange, currency)
-        self.ib.qualifyContracts(idx)
-        return idx
-    
-    def historical_vix(self, duration: str = "10 Y", bar_size: str = "1 day", use_rth: bool = True) -> pd.DataFrame:
-        """
-        Descarga histórico de VIX (CBOE). Usaremos el close diario como proxy de IV 30d.
-        """
-        vix = self.index("VIX", exchange="CBOE", currency="USD")
-        df: pd.DataFrame = self.historical_bars(vix, duration=duration, bar_size=bar_size, what="TRADES", use_rth=use_rth)
-    
-        # Normaliza nombre de close
-        if not df.empty:
-            df = df[["datetime", "close"]].copy()
-            df = df.rename(columns={"close": "vix_close"})
-            return df
-
-# =============================
-# Manual smoke test
-# =============================
-if __name__ == "__main__":
-    # IMPORTANTE: para evitar 10089/10091 en consola, deja use_market_data=False
-    cfg = IBKRConfig(host="127.0.0.1", port=7497, client_id=28, use_market_data=False)
-    ibd = IBKRData(cfg)
-
-    try:
-        ibd.connect()
-
-        spy = ibd.stock("SPY")
-        px = ibd.reference_price(spy)
-        print("SPY ref price (history-based):", px)
-
-        chain = ibd.option_chain_params("SPY")
-        expiry = ibd.pick_expiry_near_days(chain.expirations, target_days=30)
-
-        K, c, p = ibd.find_valid_atm_straddle(
-            symbol="SPY",
-            expiry=expiry,
-            strikes=chain.strikes,
-            trading_class=chain.tradingClass,
-            multiplier=chain.multiplier
-=======
         vix = self.index("VIX", exchange="CBOE", currency="USD")
         df = self.historical_bars(
             vix,
@@ -299,7 +225,6 @@ if __name__ == "__main__":
             bar_size=bar_size,
             what="TRADES",
             use_rth=use_rth
->>>>>>> 123b099418ae546f899d96f222ddf13326b44aaf
         )
 
         if df.empty:
@@ -308,3 +233,4 @@ if __name__ == "__main__":
         df = df[["datetime", "close"]].copy()
         df = df.rename(columns={"close": "vix_close"})
         return df
+
