@@ -21,11 +21,13 @@ straddle:
 # Volatility / Pricing
 # ============================
 pricing:
-  vol_window: 20                # rolling window para vol histórica
-  vol_annualization: 252
-  risk_free_rate: 0.0           # simplificación inicial
+  vol_model: "hv_vix_blend"
+  hv_window: 20
+  hv_annualization: 252
+  vix_weight: 0.6
+  risk_free_rate: 0.0
   dividend_yield: 0.0
-  days_in_year: 365              # para theta_day
+  days_in_year: 365          
 
 # ============================
 # Delta hedge
