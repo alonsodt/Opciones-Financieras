@@ -103,6 +103,7 @@ def simulate_periodic_straddle(
     pricing: PricingParams,
     hedge: HedgeParams,
     initial_cash: float = 100000.0
+    sigma_col: str = "sigma_proxy"
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
     Simula:
