@@ -144,3 +144,50 @@ def straddle_greeks(
         "put_price": put.price,
     }
 
+def sigma_proxy_hv_vix(
+    df_spy: pd.DataFrame,
+    df_vix: pd.DataFrame,
+    hv_window: int = 20,
+    hv_annualization: int = 252,
+    vix_weight: float = 0.6,
+    sigma_floor: float = 0.05,
+    sigma_cap: float = 2.00,
+) -> pd.DataFrame:
+    """
+    Construye una sigma proxy dinámica:
+      sigma = w*(VIX/100) + (1-w)*HV
+    donde HV es vol histórica anualizada rolling (log-returns).
+    VIX es % anualizado (~30 días) -> VIX/100.
+
+    Devuelve df con columnas: close, hv, vix, sigma_proxy
+    """
+    if "datetime" not in df_spy.columns or "close" not in df_spy.columns:
+        raise ValueError("df_spy necesita columnas: datetime, close")
+    if "datetime" not in df_vix.columns or "vix_close" not in df_vix.columns:
+        raise ValueError("df_vix necesita columnas: datetime, vix_close")
+
+    spy = df_spy.copy()
+    spy["datetime"] = pd.to_datetime(spy["datetime"]).dt.tz_localize(None)
+    spy = spy.sort_values("datetime").set_index("datetime")
+
+    vix = df_vix.copy()
+    vix["datetime"] = pd.to_datetime(vix["datetime"]).dt.tz_localize(None)
+    vix = vix.sort_values("datetime").set_index("datetime")
+
+    # HV anualizada
+    hv = hist_vol_close(spy["close"], window=hv_window, annualization=hv_annualization)
+    spy["hv"] = hv
+
+    # VIX -> sigma
+    # VIX close suele venir en puntos (ej 18.5) => 0.185
+    spy["vix"] = vix["vix_close"].reindex(spy.index).ffill()
+    spy["sigma_vix"] = spy["vix"] / 100.0
+
+    # Mezcla
+    w = float(vix_weight)
+    spy["sigma_proxy"] = w * spy["sigma_vix"] + (1.0 - w) * spy["hv"]
+
+    # Limpieza (floor/cap para evitar valores raros o NaNs al inicio)
+    spy["sigma_proxy"] = spy["sigma_proxy"].clip(lower=sigma_floor, upper=sigma_cap)
+
+    return spy.reset_index()[["datetime", "close", "hv", "vix", "sigma_proxy"]]
