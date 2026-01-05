@@ -315,17 +315,17 @@ class IBKRData:
         return idx
 
     def historical_vix(self, duration: str = "10 Y", bar_size: str = "1 day", use_rth: bool = True) -> pd.DataFrame:
-    """
-    Descarga histórico de VIX (CBOE). Usaremos el close diario como proxy de IV 30d.
-    """
+        """
+        Descarga histórico de VIX (CBOE). Usaremos el close diario como proxy de IV 30d.
+        """
         vix = self.index("VIX", exchange="CBOE", currency="USD")
         df = self.historical_bars(vix, duration=duration, bar_size=bar_size, what="TRADES", use_rth=use_rth)
     
-    # Normaliza nombre de close
+        # Normaliza nombre de close
         if not df.empty:
             df = df[["datetime", "close"]].copy()
             df = df.rename(columns={"close": "vix_close"})
-        return df
+            return df
 
 # =============================
 # Manual smoke test
