@@ -13,13 +13,21 @@ Requisitos:
 - Cuenta demo/paper (recomendado)
 """
 
-from __future__ import annotations
+# scripts/paper_trade.py
+# -*- coding: utf-8 -*-
 
-import argparse
-import math
-import time
-from dataclasses import dataclass
-from typing import Optional, Tuple
+from __future__ import annotations
+import asyncio
+import sys
+
+if sys.platform.startswith("win"):
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
+try:
+    asyncio.get_running_loop()
+except RuntimeError:
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
 
 from ib_insync import IB, Stock, Option, util, Contract, Bag, ComboLeg, LimitOrder, MarketOrder
 
