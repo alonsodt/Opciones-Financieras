@@ -17,6 +17,7 @@ Requisitos:
 # -*- coding: utf-8 -*-
 
 from __future__ import annotations
+
 import asyncio
 import sys
 
@@ -29,8 +30,17 @@ except RuntimeError:
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
-from ib_insync import IB, Stock, Option, util, Contract, Bag, ComboLeg, LimitOrder, MarketOrder
+from dataclasses import dataclass         
+import argparse
+import math
+import time
+from typing import Optional, Tuple
 
+from ib_insync import (
+    IB, Stock, Option, util,
+    Contract, Bag, ComboLeg,
+    LimitOrder, MarketOrder
+)
 
 # -------------------------
 # Config
