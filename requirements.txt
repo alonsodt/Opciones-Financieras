@@ -5,3 +5,6 @@ matplotlib>=3.8
 scipy>=1.10
 python-dotenv>=1.0
 pyyaml>=6.0
+tabulate>=0.9
+nest_asyncio>=1.6
+eventkit>=1.0
