@@ -196,4 +196,5 @@ La práctica muestra que:
 ---
 
 **Autor:** Alonso Díaz Tapia
+
 **Máster:** IA aplicada a los Mercados Financieros (MIAX)
