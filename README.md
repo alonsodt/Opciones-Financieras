@@ -76,7 +76,7 @@ El proceso es **totalmente reproducible** y no depende del estado de la cuenta d
 
 ---
 
-### Paper trading 
+### Paper trading (opcional)
 
 Se incluye un script para enviar órdenes reales en **cuenta demo de IBKR**:
 
