@@ -197,4 +197,3 @@ La práctica muestra que:
 
 **Autor:** Alonso Díaz Tapia
 **Máster:** IA aplicada a los Mercados Financieros (MIAX)
-Si quieres, en un último mensaje puedo revisar el `REFLEXION.md` para que tenga exactamente el mismo tono académico que este README.
