@@ -2,4 +2,6 @@ ib-insync>=0.9.86
 pandas>=2.0
 numpy>=1.24
 matplotlib>=3.8
+scipy>=1.10
 python-dotenv>=1.0
+pyyaml>=6.0
