@@ -40,8 +40,7 @@ practica-4-opciones/
 │  ├─ strategy.py       # Long straddle y delta-hedge
 │  ├─ execution.py      # Simulación de ejecución (legging)
 │  ├─ analytics.py      # Métricas y gráficos
-│  ├─ backtest.py       # Neutralización de delta con opciones
-│  └─ utils.py
+│  └─ backtest.py       # Neutralización de delta con opciones
 ├─ scripts/
 │  ├─ run_all.py        # Script principal (ejecuta toda la práctica)
 │  └─ paper_trade.py    # (Extra) Paper trading en cuenta demo IBKR
